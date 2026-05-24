@@ -107,8 +107,42 @@ async function loadWatchlist(
   return out
 }
 
+// 替换原 buildStockUpsert
+function buildStockUpsert(code: string, payload: string) {
+  const f = payload.split(",")
+  // Sina 股票接口字段：0=名称 1=开盘 2=昨收 3=当前价(收盘) 4=最高 5=最低
+  //                  6=买一 7=卖一 8=成交量 9=成交额 ... 30=日期 31=时间
+  if (f.length < 32) return null
+
+  const current = parseFloat(f[3])
+  if (!Number.isFinite(current) || current <= 0) return null  // 停牌/异常
+
+  const date = f[30]
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null
+
+  const pk = `${code}-${date}`
+  return {
+    type: "upsert" as const,
+    key: pk,
+    properties: {
+      "代码-日期": Builder.title(pk),
+      "代码":     Builder.richText(code),
+      "名称":     Builder.richText(f[0]),
+      "日期":     Builder.date(date),
+      "开盘":     Builder.number(parseFloat(f[1])),
+      "收盘":     Builder.number(parseFloat(f[3])),
+      "最高":     Builder.number(parseFloat(f[4])),
+      "最低":     Builder.number(parseFloat(f[5])),
+      "成交量":   Builder.number(parseFloat(f[8])),
+      "成交额":   Builder.number(parseFloat(f[9])),
+      "数据源":   Builder.select("sina"),
+    },
+    upstreamUpdatedAt: `${date}T${f[31] || "15:30:00"}+08:00`,
+  }
+}
+
 // 单 sync 单 target：不再带 targetDatabaseKey
-function buildStockUpsert(code: string, payload: string, date: string) {
+function buildStockUpsert2(code: string, payload: string, date: string) {
   const f = payload.split(",")
   if (f.length < 10 || !f[1] || f[1] === "0.000") return null
   const pk = `${code}-${date}`
@@ -169,7 +203,7 @@ worker.sync("dailyQuote", {
   async execute(_state, { notion }) {
     const now = new Date()
     // if (!isTradingDay(now)) return { changes: [], hasMore: false }
-    const date = now.toISOString().slice(0, 10)
+    // const date = now.toISOString().slice(0, 10)
 
     const targets = await loadWatchlist(notion)
     const codes = targets.filter(t => t.type !== "open_fund").map(t => t.code)
@@ -183,7 +217,8 @@ worker.sync("dailyQuote", {
     const changes = codes
       .map(code => {
         const p = map[code]
-        return p ? buildStockUpsert(code, p, date) : null
+        // return p ? buildStockUpsert(code, p, date) : null
+        return p ? buildStockUpsert(code, p) : null
       })
       .filter(<T,>(x: T | null): x is T => x !== null)
 
