@@ -16,7 +16,8 @@
 		"typescript": "^5.9.3"
 	},
 	"dependencies": {
-		"@notionhq/workers": ">=0.0.0",
+		"@notionhq/client": "^5.22.0",
+		"@notionhq/workers": "^0.4.0",
 		"iconv-lite": "^0.7.2"
 	}
 }

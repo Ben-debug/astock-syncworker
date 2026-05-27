@@ -7,7 +7,8 @@ import iconv from "iconv-lite"
 const worker = new Worker()
 export default worker
 
-const sina = worker.pacer("sina", { allowedRequests: 10, intervalMs: 1000 })
+const sina      = worker.pacer("sina",      { allowedRequests: 10, intervalMs: 1000 })
+const eastmoney = worker.pacer("eastmoney", { allowedRequests: 3,  intervalMs: 1000 })
 
 // ───────────────────────── Managed DBs ─────────────────────────
 const quotes = worker.database("quotes", {
@@ -44,31 +45,20 @@ const fundNav = worker.database("fundNav", {
       "代码":     Schema.richText(),
       "名称":     Schema.richText(),
       "净值日期": Schema.date(),
+      "单位净值": Schema.number(),  // 新增：基金公司当日公布的标准净值
       "累计净值": Schema.number(),
       "日涨幅":   Schema.number(),
-      "数据源":   Schema.select([{ name: "sina", color: "blue" }]),
+      "数据源":   Schema.select([
+        { name: "sina",      color: "blue"   },
+        { name: "eastmoney", color: "orange" },  // 新增
+      ]),
     },
   },
 })
 
-// ───────────────────────── 共享工具 ─────────────────────────
+// ───────────────────────── 类型 / 工具 ─────────────────────────
 type TargetType = "stock" | "etf" | "lof" | "open_fund"
-type Target = { code: string; type: TargetType }
-
-async function sinaFetch(codes: string[]): Promise<Record<string, string>> {
-  if (codes.length === 0) return {}
-  await sina.wait()
-  const url = `https://hq.sinajs.cn/list=${codes.join(",")}`
-  const res = await fetch(url, { headers: { Referer: "https://finance.sina.com.cn" } })
-  const buf = Buffer.from(await res.arrayBuffer())
-  const text = iconv.decode(buf, "gb18030")
-  const out: Record<string, string> = {}
-  for (const line of text.split("\n")) {
-    const m = line.match(/hq_str_(\w+)="([^"]*)"/)
-    if (m) out[m[1]] = m[2]
-  }
-  return out
-}
+type Target = { code: string; type: TargetType; name: string }
 
 function chunk<T>(arr: T[], n: number): T[][] {
   const out: T[][] = []
@@ -99,15 +89,31 @@ async function loadWatchlist(
       const props = (page as any).properties
       const code = props["代码"]?.title?.[0]?.plain_text?.trim()
       const type = props["类型"]?.select?.name as TargetType | undefined
+      const name = props["名称"]?.rich_text?.[0]?.plain_text?.trim() ?? ""
       if (!code || !type) continue
-      out.push({ code, type })
+      out.push({ code, type, name })
     }
     cursor = resp.has_more ? resp.next_cursor ?? undefined : undefined
   } while (cursor)
   return out
 }
 
-// 替换原 buildStockUpsert
+// ───────────────────────── 数据源 A：新浪（股票 / ETF / LOF）─────────────────────────
+async function sinaFetch(codes: string[]): Promise<Record<string, string>> {
+  if (codes.length === 0) return {}
+  await sina.wait()
+  const url = `https://hq.sinajs.cn/list=${codes.join(",")}`
+  const res = await fetch(url, { headers: { Referer: "https://finance.sina.com.cn" } })
+  const buf = Buffer.from(await res.arrayBuffer())
+  const text = iconv.decode(buf, "gb18030")
+  const out: Record<string, string> = {}
+  for (const line of text.split("\n")) {
+    const m = line.match(/hq_str_(\w+)="([^"]*)"/)
+    if (m) out[m[1]] = m[2]
+  }
+  return out
+}
+
 function buildStockUpsert(code: string, payload: string) {
   const f = payload.split(",")
   // Sina 股票接口字段：0=名称 1=开盘 2=昨收 3=当前价(收盘) 4=最高 5=最低
@@ -141,41 +147,44 @@ function buildStockUpsert(code: string, payload: string) {
   }
 }
 
-// 单 sync 单 target：不再带 targetDatabaseKey
-function buildStockUpsert2(code: string, payload: string, date: string) {
-  const f = payload.split(",")
-  if (f.length < 10 || !f[1] || f[1] === "0.000") return null
-  const pk = `${code}-${date}`
-  return {
-    type: "upsert" as const,
-    key: pk,
-    properties: {
-      "代码-日期": Builder.title(pk),
-      "代码":     Builder.richText(code),
-      "名称":     Builder.richText(f[0]),
-      "日期":     Builder.date(date),
-      "开盘":     Builder.number(parseFloat(f[1])),
-      "收盘":     Builder.number(parseFloat(f[3])),
-      "最高":     Builder.number(parseFloat(f[4])),
-      "最低":     Builder.number(parseFloat(f[5])),
-      "成交量":   Builder.number(parseFloat(f[8])),
-      "成交额":   Builder.number(parseFloat(f[9])),
-      "数据源":   Builder.select("sina"),
-    },
-    upstreamUpdatedAt: `${date}T15:30:00+08:00`,
-  }
+// ───────────────────────── 数据源 B：天天基金 lsjz（场外基金）─────────────────────────
+type LsjzRow = {
+  FSRQ:  string   // 净值日期 yyyy-mm-dd
+  DWJZ:  string   // 单位净值
+  LJJZ:  string   // 累计净值
+  JZZZL: string   // 日涨跌率（%，字符串）
+  SGZT:  string   // 申购状态
+  SHZT:  string   // 赎回状态
 }
 
-function buildFundUpsert(rawKey: string, payload: string) {
-  const code = rawKey.replace(/^fu_/, "")
-  const f = payload.split(",")
-  if (f.length < 10) return null
+async function fetchLsjz(code: string, pageSize: number = 30): Promise<LsjzRow[]> {
+  await eastmoney.wait()
+  const url = `https://api.fund.eastmoney.com/f10/lsjz?fundCode=${code}&pageIndex=1&pageSize=${pageSize}`
+  const res = await fetch(url, {
+    headers: {
+      "Referer":    "https://fundf10.eastmoney.com/",
+      "User-Agent": "Mozilla/5.0",
+    },
+  })
+  if (!res.ok) {
+    throw new Error(`lsjz HTTP ${res.status} for ${code}`)
+  }
+  const json: any = await res.json()
+  if (json.ErrCode !== undefined && json.ErrCode !== 0) {
+    throw new Error(`lsjz ErrCode=${json.ErrCode} ${json.ErrMsg ?? ""} for ${code}`)
+  }
+  return json.Data?.LSJZList ?? []
+}
 
-  const name    = f[0]
-  const accNav  = parseFloat(f[2])
-  const navDate = f[7]
-  const pctChg  = parseFloat(f[9])
-  if (!navDate || Number.isNaN(accNav)) return null
+function buildFundUpsertFromLsjz(code: string, name: string, row: LsjzRow) {
+  const navDate = row.FSRQ
+  if (!navDate || !/^\d{4}-\d{2}-\d{2}$/.test(navDate)) return null
+
+  const unitNav = parseFloat(row.DWJZ)
+  if (!Number.isFinite(unitNav)) return null
+
+  const accNav  = parseFloat(row.LJJZ)
+  const pctChg  = parseFloat(row.JZZZL)
 
   const pk = `${code}-${navDate}`
   return {
@@ -186,24 +195,24 @@ function buildFundUpsert(rawKey: string, payload: string) {
       "代码":     Builder.richText(code),
       "名称":     Builder.richText(name),
       "净值日期": Builder.date(navDate),
-      "累计净值": Builder.number(accNav),
-      "日涨幅":   Builder.number(Number.isNaN(pctChg) ? 0 : Number(pctChg.toFixed(4))),
-      "数据源":   Builder.select("sina"),
+      "单位净值": Builder.number(unitNav),
+      "累计净值": Builder.number(Number.isFinite(accNav) ? accNav : 0),
+      "日涨幅":   Builder.number(Number.isFinite(pctChg) ? Number(pctChg.toFixed(4)) : 0),
+      "数据源":   Builder.select("eastmoney"),
     },
     upstreamUpdatedAt: `${navDate}T20:00:00+08:00`,
   }
 }
 
-// ───────────────────────── Sync #1: 股票 / ETF / LOF ─────────────────────────
+// ───────────────────────── Sync #1: 股票 / ETF / LOF（新浪）─────────────────────────
 worker.sync("dailyQuote", {
   database: quotes,
   mode: "incremental",
   schedule: "1d",
 
   async execute(_state, { notion }) {
-    const now = new Date()
+    // const now = new Date()
     // if (!isTradingDay(now)) return { changes: [], hasMore: false }
-    // const date = now.toISOString().slice(0, 10)
 
     const targets = await loadWatchlist(notion)
     const codes = targets.filter(t => t.type !== "open_fund").map(t => t.code)
@@ -217,7 +226,6 @@ worker.sync("dailyQuote", {
     const changes = codes
       .map(code => {
         const p = map[code]
-        // return p ? buildStockUpsert(code, p, date) : null
         return p ? buildStockUpsert(code, p) : null
       })
       .filter(<T,>(x: T | null): x is T => x !== null)
@@ -226,7 +234,8 @@ worker.sync("dailyQuote", {
   },
 })
 
-// ───────────────────────── Sync #2: 场外基金净值 ─────────────────────────
+// ───────────────────────── Sync #2: 场外基金净值（天天基金 lsjz）─────────────────────────
+// 每次拉最近 30 天 → 自动补齐过去 1 个月任何漏数 + 修正旧 sina 偏差行
 worker.sync("dailyFundNav", {
   database: fundNav,
   mode: "incremental",
@@ -234,23 +243,29 @@ worker.sync("dailyFundNav", {
 
   async execute(_state, { notion }) {
     const targets = await loadWatchlist(notion)
-    const keys = targets
-      .filter(t => t.type === "open_fund")
-      .map(t => (t.code.startsWith("fu_") ? t.code : `fu_${t.code}`))
+    const funds = targets.filter(t => t.type === "open_fund")
 
-    const map: Record<string, string> = {}
-    await Promise.all(
-      chunk(keys, 80).map(async batch =>
-        Object.assign(map, await sinaFetch(batch))),
-    )
+    const allChanges: NonNullable<ReturnType<typeof buildFundUpsertFromLsjz>>[] = []
+    const errors: string[] = []
 
-    const changes = keys
-      .map(rawKey => {
-        const p = map[rawKey]
-        return p ? buildFundUpsert(rawKey, p) : null
-      })
-      .filter(<T,>(x: T | null): x is T => x !== null)
+    // 串行：lsjz 对突发不友好，叠加 pacer 3 req/s 限速
+    for (const t of funds) {
+      const code = t.code.replace(/^fu_/, "")
+      try {
+        const rows = await fetchLsjz(code, 30)
+        for (const row of rows) {
+          const change = buildFundUpsertFromLsjz(code, t.name, row)
+          if (change) allChanges.push(change)
+        }
+      } catch (e: any) {
+        errors.push(`${code}: ${e?.message ?? String(e)}`)
+      }
+    }
 
-    return { changes, hasMore: false }
+    if (errors.length > 0) {
+      console.error("[dailyFundNav] errors:", errors)
+    }
+
+    return { changes: allChanges, hasMore: false }
   },
 })
