@@ -3,4 +3,4 @@
 dist/
 node_modules/
 workers.*.json
-workers.json
+# workers.json
